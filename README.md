@@ -96,11 +96,14 @@ Each workload gets a hardware-isolated VM with its own kernel. Networking is off
 
 ```bash
 smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget -qO- https://google.com   # blocked
+smolvm machine run --net --image alpine --allow-host-pattern registry.npmjs.org -- wget -qO- https://registry.npmjs.org   # exact host only
 NOTION_API_KEY=secret_… smolvm machine run --net --image alpine \
   --credential notion=NOTION_API_KEY@api.notion.com -- sh -c 'echo $NOTION_API_KEY'   # a placeholder
 ```
 
 See [credential substitution](docs/credential-substitution.md) and the [security model](docs/security-model.md).
+Use `--allow-host-pattern '*.example.com'` to allow subdomains only. The older
+`--allow-host example.com` continues to allow both the apex and subdomains.
 
 How It Works
 ------------
