@@ -15,7 +15,7 @@ smolvm
 ======
 
 **Branchable microVMs for AI agents.**
-Embed them in your app, ship them as a file, and run them free on your own machine.
+Embed lightweight virtual machines into your software, portable dev environments, and local sandboxing.
 
 Install
 -------
@@ -58,6 +58,15 @@ pip install smolmachines     # Python
 cargo add smolmachines       # Rust
 ```
 
+```ts
+import { Machine } from 'smolmachines';
+
+const m = await Machine.create({ image: 'python:3.12-alpine', network: true });
+const r = await m.exec(['python3', '-c', 'print(2 ** 10)']);
+console.log(r.stdout); // 1024
+await m.delete();
+```
+
 Source and docs: [smol-machines/smol](https://github.com/smol-machines/smol) · [smolmachines.com/docs/sdk](https://smolmachines.com/docs/sdk)
 
 Branchable
@@ -93,6 +102,8 @@ Safe
 ----
 
 Each workload gets a hardware-isolated VM with its own kernel. Networking is off by default, egress can be limited to named hosts, and code can use a credential without ever reading it.
+
+Safety is a shared responsibility. smolvm provides the boundary: a separate VM and kernel for every workload, with nothing reaching the host unless you allow it. You decide what crosses that boundary. Every folder you mount, port you open, host you allow, and secret or SSH agent you forward becomes something the workload can use, so give an untrusted workload only what it needs.
 
 ```bash
 smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget -qO- https://google.com   # blocked
