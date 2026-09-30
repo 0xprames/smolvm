@@ -367,13 +367,37 @@ fn link_completed_memory(_: &Path, _: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// How many restored checkpoints stay ready for a fast revisit, and within how
+/// much space. Each entry holds a whole checkpoint's RAM and disks, so the count
+/// alone could keep tens of GiB for large machines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreCache {
+    /// Checkpoints kept; 0 turns the cache off.
+    pub entries: usize,
+    /// Allocated bytes the kept checkpoints may hold together.
+    pub max_bytes: u64,
+}
+
+impl Default for RestoreCache {
+    fn default() -> Self {
+        Self {
+            entries: 3,
+            max_bytes: 16 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
 /// Materialize a stored checkpoint for restore, diffing against the node's
-/// restore base (a pristine clone of whatever restored last) so only changed
-/// chunks are written, then keep a clone of this materialization as the next
-/// base. Both the CLI and the API restore paths go through here so the base
-/// policy lives in one place.
-pub fn materialize_for_restore(artifact: &Path, cache_dir: &Path) -> Result<()> {
-    materialize_for_restore_at(artifact, cache_dir, None)
+/// bounded cache of pristine checkpoint materializations. Exact revisits clone
+/// without rewriting RAM; misses diff against a recent checkpoint. Both the CLI
+/// and API use the same cache policy; `restore_cache` bounds it, and zero entries
+/// disables retention and falls back to the legacy base.
+pub fn materialize_for_restore(
+    artifact: &Path,
+    cache_dir: &Path,
+    restore_cache: RestoreCache,
+) -> Result<()> {
+    materialize_for_restore_at(artifact, cache_dir, None, restore_cache)
 }
 
 /// [`materialize_for_restore`] for a retained ancestor generation. Ancestors
@@ -382,6 +406,7 @@ pub fn materialize_for_restore_at(
     artifact: &Path,
     cache_dir: &Path,
     generation: Option<&str>,
+    restore_cache: RestoreCache,
 ) -> Result<()> {
     if let Some(generation) = generation {
         return crate::checkpoint_store::materialize_at(artifact, generation, cache_dir)
@@ -389,26 +414,16 @@ pub fn materialize_for_restore_at(
             .map_err(|error| Error::agent("materialize checkpoint generation", error.to_string()));
     }
     let base = crate::agent::restore_base_dir();
-    let started = std::time::Instant::now();
-    crate::checkpoint_store::materialize_with_base(artifact, cache_dir, Some(&base))
-        .map_err(|error| Error::agent("materialize checkpoint", error.to_string()))?;
-    let materialized_ms = started.elapsed().as_millis() as u64;
-    let started = std::time::Instant::now();
-    // The fresh materialization is exactly this checkpoint's content, so a
-    // clone of it is the base for whatever restores next.
-    let kept = match crate::checkpoint_store::promote_base(artifact, cache_dir, &base) {
-        Ok(kept) => kept,
-        Err(error) => {
-            tracing::warn!(%error, "restore base not refreshed");
-            false
-        }
-    };
-    tracing::info!(
-        materialized_ms,
-        promote_ms = started.elapsed().as_millis() as u64,
-        base_kept = kept,
-        "checkpoint restore materialized"
-    );
+    let cache = base.with_file_name("_restore-checkpoints");
+    crate::checkpoint_store::materialize_cached(
+        artifact,
+        cache_dir,
+        &cache,
+        Some(&base),
+        restore_cache.entries,
+        restore_cache.max_bytes,
+    )
+    .map_err(|error| Error::agent("materialize checkpoint", error.to_string()))?;
     Ok(())
 }
 
@@ -648,7 +663,12 @@ pub fn restore_from_path_at(
             smolvm_pack::extract::extract_sidecar(artifact, &cache_dir, footer, false, false)
                 .map_err(|error| Error::agent("extract checkpoint", error.to_string()))?;
         } else {
-            materialize_for_restore_at(artifact, &cache_dir, generation.as_deref())?;
+            materialize_for_restore_at(
+                artifact,
+                &cache_dir,
+                generation.as_deref(),
+                RestoreCache::default(),
+            )?;
         }
         log_phase(name, "restore_extract", &mut phase);
         install(&cache_dir, &vm_data, checkpoint)?;
