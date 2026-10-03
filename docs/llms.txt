@@ -4,6 +4,7 @@
 > the reference for each feature.
 
 - [dev-env](dev-env/SKILL.md): a machine you come back to, and what survives a stop and start
+- [docker-in-machine](docker-in-machine/SKILL.md): a Docker daemon inside a machine, for tools that call Docker themselves
 - [install](install/SKILL.md): installing smolvm and proving the host can boot a microVM
 - [local-api](local-api/SKILL.md): driving the machine lifecycle over the local HTTP API
 - [teardown](teardown/SKILL.md): what state exists, where it lives, and how to leave nothing running
