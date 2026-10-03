@@ -3,4 +3,5 @@
 > Tested procedures, one task each, with their scripts. The flat pages in this directory are
 > the reference for each feature.
 
+- [install](install/SKILL.md): installing smolvm and proving the host can boot a microVM
 - [throwaway-machine](throwaway-machine/SKILL.md): running untrusted code in a throwaway machine, with egress granted one host at a time
