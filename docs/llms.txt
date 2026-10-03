@@ -3,6 +3,7 @@
 > Tested procedures, one task each, with their scripts. The flat pages in this directory are
 > the reference for each feature.
 
+- [branch-and-checkpoint](branch-and-checkpoint/SKILL.md): scheduled checkpoints with history, restores, pause and resume, and branches with their branch point kept
 - [dev-env](dev-env/SKILL.md): a machine you come back to, and what survives a stop and start
 - [docker-in-machine](docker-in-machine/SKILL.md): a Docker daemon inside a machine, for tools that call Docker themselves
 - [gpu-cuda](gpu-cuda/SKILL.md): CUDA Driver API calls remoted to the host NVIDIA GPU
