@@ -80,7 +80,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
     MachineInfo {
         runtime: pid.and_then(crate::agent::live_resize::RuntimeIdentity::observe),
         name: name.to_string(),
-        image: record.image.clone(),
+        image: record.display_image().map(str::to_string),
         state: actual_state.to_string(),
         cpus: record.cpus,
         mem: record.mem,
@@ -3124,6 +3124,29 @@ pub async fn start_machine(
             .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
     }
 
+    // A machine with no network cannot pull its registry image in-guest; the
+    // host fetches it instead, authorized with the credentials this start
+    // carries, as the guest's pull would be. A restore resumes a guest that
+    // already has its image.
+    if record.image_needs_host_fetch()
+        && crate::portable_checkpoint::pending_dir(&vm_data_dir(&name)).is_none()
+    {
+        let auth = match &registry_auth {
+            Some(auth) => crate::registry::PullAuth::Basic {
+                username: auth.username.clone(),
+                password: auth.password.clone(),
+            },
+            None => crate::registry::PullAuth::FromConfig,
+        };
+        let image = record.image.clone().unwrap_or_default();
+        let local = crate::image_store::fetch_image_archive(&image, &auth).await?;
+        record.pin_host_fetched_image(local.clone());
+        state
+            .update_vm(&name, move |r| r.pin_host_fetched_image(local))
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    }
+
     let mounts = record.host_mounts();
     let ports = record.port_mappings();
     let resources = record.vm_resources();
@@ -3139,6 +3162,7 @@ pub async fn start_machine(
     let storage_gb = record.storage_gb;
     let overlay_gb = record.overlay_gb;
     let source_smolmachine = record.source_smolmachine.clone();
+    let launch_image = record.image.clone();
     let dns_filter_hosts = record.dns_filter_hosts.clone();
     let credential_launch = crate::credentials::CredentialLaunch::for_record(&name, &record);
     let record_golden = record.golden.clone();
@@ -3202,6 +3226,7 @@ pub async fn start_machine(
         let mut features = crate::api::state::build_launch_features(
             Some(&name_clone),
             source_smolmachine.as_deref(),
+            launch_image.as_deref(),
             dns_filter_hosts,
             credential_launch,
         )
@@ -4118,6 +4143,7 @@ async fn boot_prepared_fork_inner(
         let mut features = crate::api::state::build_launch_features(
             Some(&clone_b),
             record.source_smolmachine.as_deref(),
+            record.image.as_deref(),
             record.dns_filter_hosts.clone(),
             crate::credentials::CredentialLaunch::for_record(&clone_b, &record),
         )
