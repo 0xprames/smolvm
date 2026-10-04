@@ -494,6 +494,149 @@ fn checkpoint_cache_evict(dir: &std::path::Path, max: u64) {
     }
 }
 
+/// One cache take of a checkpoint, shared by every restore of it that overlaps.
+///
+/// Each take links a fresh alias of the cached artifact, and every link or
+/// unlink changes the inode's ctime, which voids the verifications other
+/// restores just made: a burst of N restores of one checkpoint then re-hashed
+/// the whole artifact N times, one after another under the cache locks.
+/// Restores that arrive while a take is alive reuse its pinned, verified alias
+/// instead, so the inode stays still and its proofs keep holding. The alias is
+/// released when the last of them finishes.
+struct SharedCheckpointTake {
+    _transfer: CheckpointTransfer,
+    artifact: std::path::PathBuf,
+    verified: Option<crate::portable_checkpoint::VerifiedSidecar>,
+}
+
+type SharedTakeSlot = std::sync::Arc<tokio::sync::Mutex<std::sync::Weak<SharedCheckpointTake>>>;
+
+static SHARED_CHECKPOINT_TAKES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, SharedTakeSlot>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// How long a checkpoint's take outlives its last restore. A restore that links
+/// a new alias changes the inode's ctime and so re-hashes the whole artifact;
+/// restores minutes apart reuse the same take instead and skip that work.
+const SHARED_TAKE_LINGER: Duration = Duration::from_secs(300);
+
+/// At most this many takes linger, bounding the disk their pinned links hold.
+const SHARED_TAKE_LINGER_MAX: usize = 8;
+
+type LingeringTakes =
+    std::collections::HashMap<String, (std::sync::Arc<SharedCheckpointTake>, std::time::Instant)>;
+
+/// Takes kept alive past their last restore, with when they were last used.
+static LINGERING_CHECKPOINT_TAKES: std::sync::LazyLock<std::sync::Mutex<LingeringTakes>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Keep `take` alive for [`SHARED_TAKE_LINGER`], dropping expired takes and,
+/// past [`SHARED_TAKE_LINGER_MAX`], the least recently used one.
+fn linger_checkpoint_take(key: &str, take: &std::sync::Arc<SharedCheckpointTake>) {
+    let mut lingering = LINGERING_CHECKPOINT_TAKES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = std::time::Instant::now();
+    lingering.retain(|_, (_, used)| now.duration_since(*used) < SHARED_TAKE_LINGER);
+    lingering.insert(key.to_string(), (take.clone(), now));
+    while lingering.len() > SHARED_TAKE_LINGER_MAX {
+        let Some(oldest) = lingering
+            .iter()
+            .min_by_key(|(_, (_, used))| *used)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        lingering.remove(&oldest);
+    }
+}
+
+/// Release lingering takes once idle, so their links free disk without
+/// waiting for the next restore to prune them.
+fn spawn_checkpoint_take_reaper() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async {
+                loop {
+                    tokio::time::sleep(SHARED_TAKE_LINGER / 4).await;
+                    let expired: Vec<_> = {
+                        let mut lingering = LINGERING_CHECKPOINT_TAKES
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let now = std::time::Instant::now();
+                        let keys: Vec<String> = lingering
+                            .iter()
+                            .filter(|(_, (_, used))| {
+                                now.duration_since(*used) >= SHARED_TAKE_LINGER
+                            })
+                            .map(|(key, _)| key.clone())
+                            .collect();
+                        keys.into_iter()
+                            .filter_map(|key| lingering.remove(&key))
+                            .collect()
+                    };
+                    // The take's cleanup locks and unlinks, so it runs off the runtime.
+                    if !expired.is_empty() {
+                        let _ = tokio::task::spawn_blocking(move || drop(expired)).await;
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// The live take of `key`, or a new one from the node-local cache; `None` on a miss.
+async fn shared_checkpoint_take(
+    key: &str,
+) -> Result<Option<std::sync::Arc<SharedCheckpointTake>>, ApiError> {
+    let slot = {
+        let mut slots = SHARED_CHECKPOINT_TAKES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Forget slots nobody holds or waits on whose take has ended.
+        slots.retain(|_, slot| {
+            std::sync::Arc::strong_count(slot) > 1
+                || slot.try_lock().map_or(true, |take| take.strong_count() > 0)
+        });
+        slots.entry(key.to_string()).or_default().clone()
+    };
+    // Held across the take so overlapping restores of `key` wait for it
+    // rather than each linking an alias of their own.
+    let mut live = slot.lock().await;
+    spawn_checkpoint_take_reaper();
+    if let Some(take) = live.upgrade() {
+        linger_checkpoint_take(key, &take);
+        return Ok(Some(take));
+    }
+    let transfer = tempfile::Builder::new()
+        .prefix("checkpoint-restore-")
+        .tempdir_in(checkpoint_transfer_root()?)
+        .map_err(|error| ApiError::internal(format!("create checkpoint transfer: {error}")))?;
+    let artifact = transfer.path().join("upload.smolcheckpoint");
+    let transfer = CheckpointTransfer {
+        _directory: Some(transfer),
+        artifact: artifact.clone(),
+    };
+    let cached = {
+        let (key, artifact) = (key.to_string(), artifact.clone());
+        tokio::task::spawn_blocking(move || checkpoint_cache_take(&key, &artifact))
+            .await
+            .map_err(|error| ApiError::internal(format!("checkpoint cache task: {error}")))?
+    };
+    let Some(cached) = cached else {
+        return Ok(None);
+    };
+    let take = std::sync::Arc::new(SharedCheckpointTake {
+        _transfer: transfer,
+        artifact,
+        verified: cached.verified,
+    });
+    *live = std::sync::Arc::downgrade(&take);
+    linger_checkpoint_take(key, &take);
+    Ok(Some(take))
+}
+
 fn checkpoint_transfer_root() -> Result<std::path::PathBuf, ApiError> {
     let root = std::env::var_os("SMOLVM_PACK_STAGING")
         .map(std::path::PathBuf::from)
@@ -1474,30 +1617,39 @@ pub async fn restore_portable_checkpoint(
         .transpose()
         .map_err(|error| ApiError::BadRequest(format!("invalid restore ports: {error}")))?
         .unwrap_or_default();
-    let transfer = tempfile::Builder::new()
-        .prefix("checkpoint-restore-")
-        .tempdir_in(checkpoint_transfer_root()?)
-        .map_err(|error| ApiError::internal(format!("create checkpoint transfer: {error}")))?;
-    let artifact = transfer.path().join("upload.smolcheckpoint");
-    let _transfer = CheckpointTransfer {
-        _directory: Some(transfer),
-        artifact: artifact.clone(),
+    // A cached artifact is hard-linked straight into a staging directory:
+    // nothing is created or fetched, and the cache's own inode is untouched by
+    // whatever the restore does with its copy. Overlapping restores of the same
+    // checkpoint share one such link (see `SharedCheckpointTake`).
+    let shared_take = match options.cache_key.as_deref() {
+        Some(key) => shared_checkpoint_take(key).await?,
+        None => None,
+    };
+    let cache_hit = shared_take.is_some();
+    // Each request owns its own descriptor of the shared proof.
+    let verified = shared_take
+        .as_ref()
+        .and_then(|take| take.verified.as_ref())
+        .and_then(|proof| proof.try_clone().ok());
+    // A miss uploads into a staging directory of this request's own.
+    let (artifact, _transfer) = match &shared_take {
+        Some(take) => (take.artifact.clone(), None),
+        None => {
+            let transfer = tempfile::Builder::new()
+                .prefix("checkpoint-restore-")
+                .tempdir_in(checkpoint_transfer_root()?)
+                .map_err(|error| {
+                    ApiError::internal(format!("create checkpoint transfer: {error}"))
+                })?;
+            let artifact = transfer.path().join("upload.smolcheckpoint");
+            let transfer = CheckpointTransfer {
+                _directory: Some(transfer),
+                artifact: artifact.clone(),
+            };
+            (artifact, Some(transfer))
+        }
     };
     let limit = max_checkpoint_upload_bytes();
-    // A cached artifact is hard-linked straight into the staging directory:
-    // nothing is created or fetched, and the cache's own inode is untouched by
-    // whatever the restore does with its copy. Checked before any file exists
-    // at `artifact`, since a link cannot land on an existing path.
-    let cached = if let Some(key) = options.cache_key.clone() {
-        let artifact = artifact.clone();
-        tokio::task::spawn_blocking(move || checkpoint_cache_take(&key, &artifact))
-            .await
-            .map_err(|error| ApiError::internal(format!("checkpoint cache task: {error}")))?
-    } else {
-        None
-    };
-    let cache_hit = cached.is_some();
-    let verified = cached.and_then(|entry| entry.verified);
     let received: u64 = if cache_hit {
         std::fs::metadata(&artifact).map(|m| m.len()).unwrap_or(0)
     } else {
@@ -1628,7 +1780,9 @@ pub async fn restore_portable_checkpoint(
     let result = create_machine_inner(State(state), Json(request), verified, cache_hit).await;
     #[cfg(target_os = "linux")]
     drop(prepared);
-    if result.is_ok() {
+    // A hit is already cached; re-linking it would only change the inode's
+    // ctime under the restores still sharing it.
+    if result.is_ok() && !cache_hit {
         if let Some(key) = options.cache_key {
             if let Err(error) =
                 tokio::task::spawn_blocking(move || checkpoint_cache_put(&key, &artifact)).await
