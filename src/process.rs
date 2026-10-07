@@ -1028,6 +1028,13 @@ fn build_seccomp_program(
         libc::SYS_process_vm_readv,
     ];
 
+    // A retained checkpoint streams file-backed RAM into its control socket.
+    // libc omits the aarch64 number; Linux asm-generic defines it as 71.
+    #[cfg(target_arch = "aarch64")]
+    allowed.push(71);
+    #[cfg(not(target_arch = "aarch64"))]
+    allowed.push(libc::SYS_sendfile);
+
     // An async block ring is created with R_DISABLED, fixed-file-only and
     // readv/writev-only restrictions before this filter is installed.  The
     // running VMM may enter that ring, but cannot create or reconfigure one:
@@ -4210,6 +4217,51 @@ mod tests {
                 libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
                 "forbidden syscall (kexec_load) should trigger SIGSYS, status={status:#x}"
             );
+        }
+    }
+
+    /// Incremental captures send immutable RAM files to a Unix control socket
+    /// after the seccomp filter is installed on the running VMM.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn seccomp_allows_checkpoint_sendfile() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::FileExt;
+
+        let program = build_seccomp_program(true, false).expect("build seccomp program");
+        let file = tempfile::tempfile().expect("source RAM file");
+        file.write_all_at(b"snapshot", 0).expect("write source RAM");
+        let mut sockets = [0; 2];
+        unsafe {
+            assert_eq!(
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sockets.as_mut_ptr()),
+                0
+            );
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                if seccompiler::apply_filter(&program).is_err() {
+                    libc::_exit(2);
+                }
+                let mut offset: libc::off_t = 0;
+                let sent = libc::sendfile(sockets[0], file.as_raw_fd(), &mut offset, 8);
+                libc::_exit(if sent == 8 { 0 } else { 3 });
+            }
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+            let mut received = [0; 8];
+            let count = libc::read(sockets[1], received.as_mut_ptr().cast(), received.len());
+            libc::close(sockets[0]);
+            libc::close(sockets[1]);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "sendfile should survive seccomp, status={status:#x}"
+            );
+            assert_eq!(count, 8);
+            assert_eq!(&received, b"snapshot");
         }
     }
 
